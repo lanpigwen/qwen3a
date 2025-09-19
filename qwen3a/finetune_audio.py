@@ -13,20 +13,19 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-from src.qwen3_audio.modeling_qwen3_audio import Qwen3WhisperForConditionalGeneration
-from src.qwen3_audio.data import (
+from qwen3_audio import Qwen3WhisperForConditionalGeneration
+from qwen3_audio import (
     AudioTextDataset,
     AudioCollator,
     ConversationAudioDataset,
     ConversationCollator,
 )
 
-
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--whisper_model', type=str, default='openai/whisper-small')
-    ap.add_argument('--qwen3_model', type=str, required=True, help='Base Qwen3 model id/path')
-    ap.add_argument('--train_json', type=str, required=True, help='List[ {"audio": path, "text": str, "prompt": optional str} ]')
+    ap.add_argument('--whisper_model', type=str, default='/root/autodl-tmp/whisper-large-v3-turbo')
+    ap.add_argument('--qwen3_model', type=str,default='/root/autodl-tmp/qwen3', help='Base Qwen3 model id/path')
+    ap.add_argument('--train_json', type=str, default='/root/autodl-tmp/qwen_auido_train.json', help='List[ {"audio": path, "text": str, "prompt": optional str} ]')
     ap.add_argument('--output_dir', type=str, default='./outputs')
     ap.add_argument('--freeze_whisper', action='store_true')
     ap.add_argument('--train_qwen3_layers', type=int, default=0, help='Number of top Qwen3 layers to unfreeze (0=none)')
@@ -46,7 +45,7 @@ def parse_args():
     ap.add_argument('--lora_alpha', type=int, default=32)
     ap.add_argument('--lora_dropout', type=float, default=0.05)
     ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--data_mode', type=str, default='flat', choices=['flat','conversation'], help='flat: AudioTextDataset, conversation: ConversationAudioDataset')
+    ap.add_argument('--data_mode', type=str, default='conversation', choices=['flat','conversation'], help='flat: AudioTextDataset, conversation: ConversationAudioDataset')
     ap.add_argument('--user_prefix', type=str, default='<|user|>')
     ap.add_argument('--assistant_prefix', type=str, default='<|assistant|>')
     ap.add_argument('--system_prefix', type=str, default='<|system|>')
