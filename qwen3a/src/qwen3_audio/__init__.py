@@ -1,0 +1,1 @@
+from .modeling_qwen3_audio import Qwen3WhisperForConditionalGeneration
