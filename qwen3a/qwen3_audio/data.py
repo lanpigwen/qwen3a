@@ -246,7 +246,6 @@ class ConversationCollator:
     user_prefix: str = "<|user|>"
     assistant_prefix: str = "<|assistant|>"
     no_mask: bool = False
-    debug: bool = False  # 输出调试统计
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Audio padding (single audio per sample already processed)
@@ -340,16 +339,11 @@ class ConversationCollator:
                     base_ids = enc.input_ids[i]
                     valid_pos = base_ids != self.tokenizer.pad_token_id
                     labels[i][valid_pos] = base_ids[valid_pos]
-                    print(f"[ConversationCollator][fallback] sample {i} had 0 valid labels; reverted to full supervision")
 
         labels[labels == self.tokenizer.pad_token_id] = -100
 
         valid_labels = (labels != -100).sum(dim=1)
-        if self.debug:
-            for i, v in enumerate(valid_labels.tolist()):
-                print(f"[ConversationCollator][debug] sample {i} valid_label_tokens={v}/{labels.size(1)}")
-        if (valid_labels == 0).any():
-            print('[ConversationCollator] WARNING: Some samples have 0 valid labels; loss contribution=0.')
+        # Removed warnings about zero valid labels
 
         return {
             "input_features": input_features,
@@ -357,6 +351,6 @@ class ConversationCollator:
             "input_ids": enc.input_ids,
             "attention_mask": enc.attention_mask,
             "labels": labels,
-            # 供调试 callback 统计使用
+            # valid_label_count (restored silently for stabilization logic / analysis)
             "valid_label_count": valid_labels,
         }

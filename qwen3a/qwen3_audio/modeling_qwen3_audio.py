@@ -167,14 +167,9 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
                 self._projector_fp32_converted = True
                 self._printed_projector_stats = False
             proj_in = audio_hidden.float()  # (B, T_a, C_w) -> fp32
-            if not getattr(self, '_printed_projector_stats', True):
-                with torch.no_grad():
-                    print(f"[ProjectorFP32][input] mean={proj_in.mean().item():.4f} std={proj_in.std().item():.4f} max={proj_in.max().item():.4f} min={proj_in.min().item():.4f}")
-                self._printed_projector_stats = True
+            # removed projector stats print
             audio_proj = self.projector(proj_in)  # already fp32 output
-            with torch.no_grad():
-                if torch.isnan(audio_proj).any():
-                    print('[ProjectorFP32] WARNING: NaN appeared immediately after projector forward')
+            # removed projector NaN warning
             audio_proj = audio_proj.to(self.qwen3.dtype)
         else:
             audio_proj = self.projector(audio_hidden)  # (B, T_a, C_q)
@@ -240,12 +235,7 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
             if not hasattr(self, '_manual_loss_steps'):
                 self._manual_loss_steps = 0
             if self._manual_loss_steps < 6:
-                with torch.no_grad():
-                    valid_tokens = (shift_labels != -100).sum().item()
-                    std = shift_logits.float().std().item()
-                    mean = shift_logits.float().mean().item()
-                    print(f"[ManualLossDebug] step={self._manual_loss_steps} loss={loss.item():.6f} valid_tokens={valid_tokens} logits_mean={mean:.4f} logits_std={std:.4f}")
-                self._manual_loss_steps += 1
+                self._manual_loss_steps += 1  # silent increment
             # 记录 logits 供回调监控
             self.last_logits = logits.detach()
             return {"loss": loss, "logits": logits}

@@ -59,7 +59,7 @@ def parse_args():
     ap.add_argument('--assistant_prefix', type=str, default='<|assistant|>')
     ap.add_argument('--system_prefix', type=str, default='<|system|>')
     ap.add_argument('--no_mask', action='store_true', help='Do not mask user tokens (debug: train on all tokens)')
-    ap.add_argument('--debug_collator', action='store_true', help='Print per-sample valid label token stats for conversation mode')
+    # (debug flags removed)
     # Memory / quantization options
     ap.add_argument('--device_map', type=str, default=None, help="Pass 'auto' to let accelerate dispatch layers across GPUs")
     ap.add_argument('--load_in_8bit', action='store_true', help='Load Qwen3 in 8-bit (requires bitsandbytes)')
@@ -112,7 +112,6 @@ def main():
             user_prefix=args.user_prefix,
             assistant_prefix=args.assistant_prefix,
             no_mask=args.no_mask,
-            debug=args.debug_collator,
         )
 
     # Build model
@@ -246,139 +245,74 @@ def main():
         ddp_find_unused_parameters=False,
     )
 
-    # Trainer expects model to return dict with loss when labels provided.
-    # For DeepSpeed, use the model directly without wrapper
-    class LossDebugCallback(TrainerCallback):
-        def __init__(self):
-            self.step = 0
-        def on_step_end(self, args, state, control, **kwargs):
-            self.step += 1
-            # batch may contain custom fields via kwargs["inputs"]
-            batch = kwargs.get('inputs', {})
-            vlc = batch.get('valid_label_count', None)
-            if vlc is not None:
-                try:
-                    total_tokens = batch['labels'].size(1)
-                    vlc_list = vlc.tolist()
-                    print(f"[Debug][step={self.step}] valid_label_count per sample: {vlc_list} / seq_len={total_tokens}")
-                except Exception as e:
-                    print(f"[Debug] valid_label_count print error: {e}")
-            # Logits statistics (only compute lightweight stats to avoid overhead)
-            # Access last model outputs from state.log_history? Not directly; we use callback on_log below.
-            return control
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and 'loss' in logs:
-                print(f"[Debug][log] step={state.global_step} loss={logs['loss']}")
-            return control
+    # Removed LossDebugCallback and related debug logging
 
-    class NaNMonitorCallback(TrainerCallback):
-        def __init__(self, model_ref, save_dir: str, max_snapshots: int = 2):
-            self.model_ref = model_ref
-            self.snapshots = 0
-            self.max_snapshots = max_snapshots
-            self.save_dir = save_dir
-            os.makedirs(save_dir, exist_ok=True)
-            self.optimizer = None
-        def on_train_begin(self, args, state, control, **kwargs):
-            # 获取 optimizer 引用
-            self.optimizer = kwargs.get('optimizer', None)
-        def on_step_end(self, args, state, control, **kwargs):
-            model = self.model_ref
-            took_snapshot = False
-            with torch.no_grad():
-                # 检查可训练参数是否出现 NaN
-                has_nan = False
-                for name, p in model.named_parameters():
-                    if p.requires_grad and torch.isnan(p.data).any():
-                        print(f"[NaNMonitor] Detected NaN in parameter: {name}")
-                        has_nan = True
-                        break
-                if hasattr(model, 'last_logits') and model.last_logits is not None:
-                    if torch.isnan(model.last_logits).any():
-                        print('[NaNMonitor] last_logits contains NaN')
-                        has_nan = True
-                if has_nan and self.snapshots < self.max_snapshots:
-                    snap = {
-                        'step': state.global_step,
-                        'loss_log': state.log_history[-1] if state.log_history else None,
-                    }
-                    try:
-                        torch.save(snap, os.path.join(self.save_dir, f'nan_snapshot_{self.snapshots}.pt'))
-                        print(f"[NaNMonitor] Saved snapshot {self.snapshots}")
-                        self.snapshots += 1
-                        took_snapshot = True
-                    except Exception as e:
-                        print(f"[NaNMonitor] Failed to save snapshot: {e}")
-            if took_snapshot:
-                control.should_training_stop = True
-            return control
-
-    class ProjectorFreezeHook(TrainerCallback):
-        def __init__(self, model_ref):
-            self.model_ref = model_ref
-        def on_step_begin(self, args, state, control, **kwargs):
-            if getattr(self.model_ref, 'freeze_projector_steps', 0) > 0 and state.global_step < self.model_ref.freeze_projector_steps:
-                for n,p in self.model_ref.projector.named_parameters():
-                    if p.grad is not None:
-                        p.grad.zero_()
-            return control
-
-    class LoRAStabilizeCallback(TrainerCallback):
+    # Removed: NaNMonitorCallback, ProjectorFreezeHook, LoRAStabilizeCallback (all logging/debug callbacks deleted)
+    class StabilityCallback(TrainerCallback):
+        """Silent training stabilization: early LR scaling, projector freeze, LoRA grad clip, NaN grad cleanup."""
         def __init__(self, model_ref, early_steps: int, early_factor: float, lora_grad_clip: float):
             self.model_ref = model_ref
             self.early_steps = early_steps
             self.early_factor = early_factor
             self.lora_grad_clip = lora_grad_clip
             self.base_lrs = None
-            self.lora_params_cached = None
+            self.optimizer = None
+            # Cache LoRA params (if any)
+            lora_params = []
+            for n,p in model_ref.named_parameters():
+                if 'lora_A' in n or 'lora_B' in n:
+                    lora_params.append(p)
+            self.lora_params = lora_params if lora_params else None
         def on_train_begin(self, args, state, control, **kwargs):
-            # Cache optimizer param groups initial lr
             self.optimizer = kwargs.get('optimizer', None)
             if self.optimizer:
                 self.base_lrs = [g['lr'] for g in self.optimizer.param_groups]
-            # Collect LoRA params
-            lora_params = []
-            for n,p in self.model_ref.named_parameters():
-                if 'lora_A' in n or 'lora_B' in n:
-                    lora_params.append(p)
-            self.lora_params_cached = lora_params
             return control
         def on_step_begin(self, args, state, control, **kwargs):
-            if self.optimizer and self.early_steps > 0 and state.global_step < self.early_steps:
-                for g, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-                    g['lr'] = base_lr * self.early_factor
-            elif self.optimizer and self.base_lrs and self.early_steps > 0 and state.global_step == self.early_steps:
-                # restore
-                for g, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-                    g['lr'] = base_lr
+            # Early LR scaling
+            if self.optimizer and self.base_lrs and self.early_steps > 0:
+                if state.global_step < self.early_steps:
+                    for g, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                        g['lr'] = base_lr * self.early_factor
+                elif state.global_step == self.early_steps:
+                    # restore
+                    for g, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                        g['lr'] = base_lr
+            # Freeze projector initial steps
+            if getattr(self.model_ref, 'freeze_projector_steps', 0) > 0 and state.global_step < getattr(self.model_ref, 'freeze_projector_steps'):
+                for p in self.model_ref.projector.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
             return control
         def on_step_end(self, args, state, control, **kwargs):
-            # LoRA 专属梯度裁剪 & NaN guard
-            if self.lora_grad_clip > 0 and self.lora_params_cached:
-                import math
-                total_norm = 0.0
-                for p in self.lora_params_cached:
+            # LoRA grad clipping (separate)
+            if self.lora_grad_clip > 0 and self.lora_params:
+                total_norm_sq = 0.0
+                for p in self.lora_params:
                     if p.grad is None: continue
-                    param_norm = p.grad.data.float().norm(2)
-                    total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                clip_coef = self.lora_grad_clip / (total_norm + 1e-6)
-                if clip_coef < 1.0:
-                    for p in self.lora_params_cached:
-                        if p.grad is not None:
-                            p.grad.data.mul_(clip_coef)
-                if state.global_step <= 5:
-                    print(f"[LoRAStabilize] step={state.global_step} lora_grad_norm={total_norm:.2f} clip_coef={min(1.0, clip_coef):.4f}")
-            # Replace NaN grads
-            if self.lora_params_cached:
-                replaced = 0
-                for p in self.lora_params_cached:
-                    if p.grad is not None and torch.isnan(p.grad).any():
-                        p.grad.data.zero_()
-                        replaced += 1
-                if replaced > 0:
-                    print(f"[LoRAStabilize] Replaced NaN grads in {replaced} LoRA params")
+                    gnorm = p.grad.data.float().norm(2)
+                    total_norm_sq += gnorm.item() ** 2
+                if total_norm_sq > 0:
+                    total_norm = total_norm_sq ** 0.5
+                    coef = self.lora_grad_clip / (total_norm + 1e-6)
+                    if coef < 1.0:
+                        for p in self.lora_params:
+                            if p.grad is not None:
+                                p.grad.data.mul_(coef)
+            # NaN grad cleanup (only LoRA + projector to keep cheap)
+            for p in list(self.model_ref.projector.parameters()) + (self.lora_params or []):
+                if p.grad is not None and torch.isnan(p.grad).any():
+                    p.grad.data.zero_()
             return control
+
+    callbacks = [
+        StabilityCallback(
+            model,
+            early_steps=args.early_lr_steps,
+            early_factor=args.early_lr_factor,
+            lora_grad_clip=args.lora_grad_clip,
+        )
+    ]
 
     trainer = Trainer(
         model=model,
@@ -386,17 +320,7 @@ def main():
         train_dataset=dataset,
         eval_dataset=None,
         data_collator=collator,
-        callbacks=[
-            LossDebugCallback(),
-            NaNMonitorCallback(model, os.path.join(args.output_dir, 'nan_snapshots')),
-            ProjectorFreezeHook(model),
-            LoRAStabilizeCallback(
-                model,
-                early_steps=args.early_lr_steps,
-                early_factor=args.early_lr_factor,
-                lora_grad_clip=args.lora_grad_clip,
-            ),
-        ],
+        callbacks=callbacks,
     )
 
     trainer.train()
