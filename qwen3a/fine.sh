@@ -6,5 +6,5 @@ CUDA_VISIBLE_DEVICES=0 python finetune_audio.py \
   --qwen3_model /root/autodl-tmp/qwen3 \
   --train_json /root/autodl-tmp/qwen_auido_train.json \
   --output_dir ./outputs_projector_only \
-  --learning_rate 5e-5 \
-  --num_train_epochs 2
+  --learning_rate 1e-5 \
+  --num_train_epochs 1
