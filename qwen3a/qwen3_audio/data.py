@@ -245,6 +245,8 @@ class ConversationCollator:
     add_eos: bool = True
     user_prefix: str = "<|user|>"
     assistant_prefix: str = "<|assistant|>"
+    no_mask: bool = False
+    debug: bool = False  # 输出调试统计
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Audio padding (single audio per sample already processed)
@@ -266,7 +268,7 @@ class ConversationCollator:
         audio_mask = torch.stack(audio_mask)
 
         texts = [b["text"] for b in batch]
-        enc = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+        enc = self.tokenizer(texts, padding=True, return_tensors="pt")
         if self.add_eos and self.tokenizer.eos_token is not None:
             eos = self.tokenizer.eos_token_id
             new_ids = []
@@ -291,24 +293,63 @@ class ConversationCollator:
             enc["attention_mask"] = torch.stack(final_attn)
 
         labels = enc.input_ids.clone()
-        # Mask everything that is NOT assistant content
-        # 简化：直接把 user_prefix 开头到下一个 assistant_prefix 之前 mask。
-        # 更精细可以利用 role_spans + 再 token-level 对齐，这里提供基本功能。
-        input_texts = texts
-        for i, text in enumerate(input_texts):
-            # 重新 tokenize 逐 token 掩码
-            # 这里简单策略：如果一个 token 解码后不包含 assistant_prefix 且在第一个 assistant_prefix 出现前 -> mask
-            decoded_tokens = [self.tokenizer.decode([tid], skip_special_tokens=False) for tid in enc.input_ids[i]]
-            seen_assistant = False
-            for j, tok_str in enumerate(decoded_tokens):
-                if self.assistant_prefix in tok_str:
-                    seen_assistant = True
-                    # 把含有前缀自身的 token 也 mask，防止学习前缀，或保留也可以按需调整
-                    labels[i, j] = -100
-                else:
-                    if not seen_assistant:
+
+        if not self.no_mask:
+            # 精确基于每个样本的 role_spans（字符级） -> token 级映射
+            # 我们需要原始字符序列: 已经在 dataset 中构建并传入 text
+            for i, sample in enumerate(batch):
+                text = sample["text"]
+                spans = sample["role_spans"]  # list[(start, end, role)]
+                # 使用 tokenizer 的 offset mapping 来映射 token -> char span
+                # 为避免再次批处理，这里单独 encode 一次 (不会影响主批性能过多)
+                tokenized = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
+                offsets = tokenized["offset_mapping"]
+                # 建立一个数组: token 是否属于 assistant 需要被学习 (预测) 的内容
+                # 策略: assistant span 内全部 token(除其前缀标记) 设置可学习; 其它 token -> -100
+                learn_mask = [False] * len(offsets)
+                for (s, e, role) in spans:
+                    if role != "assistant":
+                        continue
+                    for tidx, (ts, te) in enumerate(offsets):
+                        if te <= s or ts >= e:
+                            continue
+                        learn_mask[tidx] = True
+                    # 掉过前缀 <|assistant|> 本身: 如果它被单独 tokenize 出现在开始区域
+                    # 通过再次 token 化前缀找出对应 token ids 序列
+                # 找出 assistant 前缀 token 序列 (同一 tokenizer 下)
+                prefix_ids = self.tokenizer(self.assistant_prefix, add_special_tokens=False).input_ids
+                # 在 tokenized.input_ids 中搜索 prefix_ids 的任意出现，并将其 learn_mask 置 False
+                ids_seq = tokenized.input_ids
+                Lp = len(prefix_ids)
+                for start in range(0, len(ids_seq) - Lp + 1):
+                    if ids_seq[start:start+Lp] == prefix_ids:
+                        for k in range(Lp):
+                            learn_mask[start + k] = False
+
+                # 现在需要把 learn_mask 映射到当前批里 pad 后的 enc.input_ids 对应位置
+                # enc 与 tokenized 在 token 数可能不同 (因为 enc 是对 texts 批量处理, 但应一致除去 padding)
+                # 这里假设 tokenizer 对同一 text 的 tokenization 稳定一致
+                seq_len = enc.input_ids[i].size(0)
+                copy_len = min(seq_len, len(learn_mask))
+                for j in range(copy_len):
+                    if not learn_mask[j]:
                         labels[i, j] = -100
+                # 剩余 (padding) 稍后统一置 -100
+                # 如果全部被屏蔽，fallback 到所有非 pad token 参与训练（避免 loss=0）
+                if (labels[i] != -100).sum() == 0:
+                    base_ids = enc.input_ids[i]
+                    valid_pos = base_ids != self.tokenizer.pad_token_id
+                    labels[i][valid_pos] = base_ids[valid_pos]
+                    print(f"[ConversationCollator][fallback] sample {i} had 0 valid labels; reverted to full supervision")
+
         labels[labels == self.tokenizer.pad_token_id] = -100
+
+        valid_labels = (labels != -100).sum(dim=1)
+        if self.debug:
+            for i, v in enumerate(valid_labels.tolist()):
+                print(f"[ConversationCollator][debug] sample {i} valid_label_tokens={v}/{labels.size(1)}")
+        if (valid_labels == 0).any():
+            print('[ConversationCollator] WARNING: Some samples have 0 valid labels; loss contribution=0.')
 
         return {
             "input_features": input_features,
@@ -316,4 +357,6 @@ class ConversationCollator:
             "input_ids": enc.input_ids,
             "attention_mask": enc.attention_mask,
             "labels": labels,
+            # 供调试 callback 统计使用
+            "valid_label_count": valid_labels,
         }
