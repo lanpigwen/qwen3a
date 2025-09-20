@@ -83,6 +83,10 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
         )
         q_config = self.qwen3.config
 
+        # Resolve inner model wrapper (some HF models wrap actual modules in .model)
+        qwen_inner = getattr(self.qwen3, 'model', self.qwen3)
+        self.qwen_inner = qwen_inner
+
         # Determine dims
         self.audio_hidden = self.whisper.config.d_model
         self.q_hidden = q_config.hidden_size
@@ -108,15 +112,30 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
 
         # Optionally freeze most Qwen3 layers except top N (train_qwen3_layers)
         if train_qwen3_layers is not None and train_qwen3_layers >= 0:
-            total_layers = len(self.qwen3.model.layers)
-            train_from = max(0, total_layers - train_qwen3_layers)
-            for i, layer in enumerate(self.qwen3.model.layers):
-                requires = i >= train_from
-                for p in layer.parameters():
-                    p.requires_grad = requires
-        # Always allow lm_head to adapt
-        for p in self.qwen3.lm_head.parameters():
-            p.requires_grad = True
+            # Try common layer containers on HF models
+            if hasattr(qwen_inner, 'layers'):
+                layers_list = getattr(qwen_inner, 'layers')
+            elif hasattr(qwen_inner, 'encoder') and hasattr(qwen_inner.encoder, 'layers'):
+                layers_list = getattr(qwen_inner.encoder, 'layers')
+            elif hasattr(qwen_inner, 'transformer') and hasattr(qwen_inner.transformer, 'layers'):
+                layers_list = getattr(qwen_inner.transformer, 'layers')
+            else:
+                layers_list = []
+
+            if len(layers_list) > 0:
+                total_layers = len(layers_list)
+                train_from = max(0, total_layers - train_qwen3_layers)
+                for i, layer in enumerate(layers_list):
+                    requires = i >= train_from
+                    for p in layer.parameters():
+                        p.requires_grad = requires
+        # Always allow lm_head to adapt (try both top-level and inner model)
+        lm_head = getattr(self.qwen3, 'lm_head', None)
+        if lm_head is None:
+            lm_head = getattr(qwen_inner, 'lm_head', None)
+        if lm_head is not None:
+            for p in lm_head.parameters():
+                p.requires_grad = True
 
         self.add_audio_token_type = add_audio_token_type
         if add_audio_token_type:
@@ -186,7 +205,19 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
 
         # 4. Text tokens -> embeddings via Qwen3 embedding layer
         if input_ids is not None:
-            text_embeds = self.qwen3.model.model.embed_tokens(input_ids)
+            # Resolve embedding layer robustly
+            emb_layer = None
+            if hasattr(self.qwen_inner, 'get_input_embeddings'):
+                emb_layer = self.qwen_inner.get_input_embeddings()
+            elif hasattr(self.qwen_inner, 'embed_tokens'):
+                emb_layer = getattr(self.qwen_inner, 'embed_tokens')
+            elif hasattr(self.qwen3, 'get_input_embeddings'):
+                emb_layer = self.qwen3.get_input_embeddings()
+            else:
+                raise RuntimeError('Could not find embedding layer on qwen3 model.')
+
+            # emb_layer is typically an nn.Embedding or callable
+            text_embeds = emb_layer(input_ids)
             if self.add_audio_token_type:
                 text_type = self.audio_type_embedding(torch.ones_like(input_ids))
                 text_embeds = text_embeds + text_type
@@ -261,7 +292,16 @@ class Qwen3WhisperForConditionalGeneration(nn.Module):
             audio_proj = self.projector(enc_out.last_hidden_state)
             audio_mask = torch.ones(audio_proj.size()[:-1], dtype=torch.long, device=audio_proj.device)
             if prompt_ids is not None:
-                text_embeds = self.qwen3.model.model.embed_tokens(prompt_ids.to(audio_proj.device))
+                # Resolve embedding for generation path
+                if hasattr(self.qwen_inner, 'get_input_embeddings'):
+                    gen_emb = self.qwen_inner.get_input_embeddings()
+                elif hasattr(self.qwen_inner, 'embed_tokens'):
+                    gen_emb = getattr(self.qwen_inner, 'embed_tokens')
+                elif hasattr(self.qwen3, 'get_input_embeddings'):
+                    gen_emb = self.qwen3.get_input_embeddings()
+                else:
+                    raise RuntimeError('Could not find embedding layer on qwen3 model for generation.')
+                text_embeds = gen_emb(prompt_ids.to(audio_proj.device))
                 inputs_embeds = torch.cat([audio_proj, text_embeds], dim=1)
                 attn_mask = torch.cat([audio_mask, torch.ones_like(prompt_ids)], dim=1)
             else:

@@ -1,18 +1,10 @@
+#!/usr/bin/env bash
+# Minimal launcher for projector-only fine-tuning
+
 CUDA_VISIBLE_DEVICES=0 python finetune_audio.py \
-  --data_mode conversation \
-  --freeze_whisper \
-  --use_lora \
-  --train_qwen3_layers 0 \
-  --num_train_epochs 0.01 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 1 \
+  --whisper_model /root/autodl-tmp/whisper-large-v3-turbo \
+  --qwen3_model /root/autodl-tmp/qwen3 \
+  --train_json /root/autodl-tmp/qwen_auido_train.json \
+  --output_dir ./outputs_projector_only \
   --learning_rate 5e-5 \
-  --projector_fp32 \
-  --freeze_projector_steps 5 \
-  --max_grad_norm 1.0 \
-  --projector_scale 1.0 \
-  --lora_fp32 \
-  --lora_init_scale 0.1 \
-  --lora_grad_clip 5.0 \
-  --early_lr_factor 0.2 \
-  --early_lr_steps 20
+  --num_train_epochs 2
