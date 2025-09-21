@@ -1,0 +1,14 @@
+[
+  {
+    "conversations": [
+      {
+        "from": "user",
+        "value": "<audio>qwen3_audio_phoneme/data/samples/sample_0001.wav</audio>请你做语音评测"
+      },
+      {
+        "from": "assistant",
+        "value": "sil sh iy"
+      }
+    ]
+  }
+]

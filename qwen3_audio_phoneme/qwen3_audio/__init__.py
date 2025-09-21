@@ -1,0 +1,2 @@
+from .modeling_qwen3_audio import Qwen3AudioForCausalLM
+from .register_model import build_model_and_tokenizer

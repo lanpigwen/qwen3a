@@ -1,0 +1,14 @@
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.41.0
+accelerate>=0.30.0
+datasets>=2.19.0
+soundfile
+numpy
+tqdm
+sentencepiece
+protobuf
+bitsandbytes
+modelscope
+ms-swift
+peft>=0.10.0
